@@ -14,4 +14,9 @@ eachother.
 
 ### How Does the BitTorrent Works ?
 - There is .torrent file which regulates number of pieces their is for given files.And how does it exchanged between peers.
-- https://wiki.theory.org/BitTorrentSpecification  ( BitTorrent specifications )
+- https://wiki.theory.org/BitTorrentSpecification  ( BitTorrent specifications ).
+
+## Step 1) Parsing .torrent file 
+- This .torrent file contains all the meta information necessary for the download such as 
+- name , URL of tracker , size. 
+- all this data in encoded into format called as "Bencoding" it binary format that can be easily tranaslated into JSON or python object literal.
