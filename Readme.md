@@ -20,3 +20,11 @@ eachother.
 - This .torrent file contains all the meta information necessary for the download such as 
 - name , URL of tracker , size. 
 - all this data in encoded into format called as "Bencoding" it binary format that can be easily tranaslated into JSON or python object literal.
+
+
+### What is Tracker ?
+- This is where the tracker comes in. A tracker is a central server keeping track of available peers for a given torrent
+
+### What we need to request Tracker to give us List of peers 
+- peer_id ( random 20 byte hash )
+- info_hash ( calculated from info dict )
