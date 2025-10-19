@@ -3,7 +3,7 @@ import hashlib
 from decoder import info_dict , decoded_content
 import bencode
 import requests
-
+from parse_peers_list import parse_peer_list
 
 
 
@@ -40,8 +40,9 @@ tracker_response = response.content
 tracker_response_decoded = bencode.decode(tracker_response)
 print("response",tracker_response_decoded)
 
-# peer list 
-peer_list = bencode.decode(tracker_response_decoded["peers6"])
-print("peer_list" , peer_list)
+# parse the peers list 
+peer_list_parsed = parse_peer_list(tracker_response_decoded)
+
+print("peer_list" , peer_list.hex())
 
 
