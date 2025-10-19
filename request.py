@@ -43,6 +43,5 @@ print("response",tracker_response_decoded)
 # parse the peers list 
 peer_list_parsed = parse_peer_list(tracker_response_decoded)
 
-print("peer_list" , peer_list.hex())
 
 

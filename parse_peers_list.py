@@ -32,7 +32,7 @@ def parse_peer_list( tracker_response_decoded ) :
             # convert the ip bytes into ip adddress string
             ip_address = socket.inet_ntop(ip_family , ip_bytes)
             # unpack port number 
-            port = struct.unpack('H',port_bytes)[0]
+            port = struct.unpack('>H',port_bytes)[0]
             
             # Appending to the list            
             peers_list.append({'ip' : ip_address , 'port' : port })
@@ -40,6 +40,8 @@ def parse_peer_list( tracker_response_decoded ) :
         except ( socket.error , struct.error ) as e :
             print(f"Error parsing the peerlist")
 
+    print("peers_list",peers_list)
+    print('number of peer',len(peers_list))
     return peers_list
         
 
