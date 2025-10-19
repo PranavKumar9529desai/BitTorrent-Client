@@ -1,7 +1,6 @@
 import bencode
 # r+ is for read and write
 # with open is used it automatically closes the file after the block
-
 with open('fedora-2.torrent' , 'rb') as file :
     bencoded_content = file.read()
 
