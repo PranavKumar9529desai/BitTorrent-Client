@@ -27,9 +27,9 @@ params = {
     'info_hash' : info_hash ,
     'peer_id' : peer_id,
     'uploaded'  :  0 ,
-    "downloaded ": 0 ,
-    "left ":  2670488632,
-    "port"  : 6889 , 
+    "downloaded": 0 ,
+    'left':  2670488632,
+    'port'  : 6889 , 
     # "compact": 1
 }
 
