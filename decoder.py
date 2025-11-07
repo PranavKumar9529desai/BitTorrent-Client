@@ -1,7 +1,7 @@
 import bencode
 # r+ is for read and write
 # with open is used it automatically closes the file after the block
-with open('fedora-2.torrent' , 'rb') as file :
+with open('f.torrent' , 'rb') as file :
     bencoded_content = file.read()
 
     # Decoding the bencoded content
@@ -25,6 +25,7 @@ with open('fedora-2.torrent' , 'rb') as file :
     # calculate the file size
     for i in info_dict :
         if i != "pieces" :
+            # as the pices has the actual bytes
             print(f"{i} : {info_dict[i]}")
 
     file_dict = info_dict["files"]
@@ -32,4 +33,4 @@ with open('fedora-2.torrent' , 'rb') as file :
     for fl in file_dict :
         size+=fl["length"]
     
-    print("Total size of file",size)
+    print("Total size of file",size,"bytes")

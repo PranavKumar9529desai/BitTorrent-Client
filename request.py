@@ -15,14 +15,14 @@ print(peer_id)
 info_dict = bencode.encode(info_dict)
 # generate info-hash ( Bitorrent used Sha2 )
 info_hash = hashlib.sha1(info_dict).digest()
-print(info_hash)
+print("info_hash",info_hash)
 
 
-# request to Torrent
+# request url to Torrent
 base_url = decoded_content['announce']
 print(base_url)
 
-# params
+# params this need to dynacmic rather than hardcoded
 params = {
     'info_hash' : info_hash ,
     'peer_id' : peer_id,

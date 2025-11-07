@@ -11,7 +11,7 @@ def parse_peer_list( tracker_response_decoded ) :
         ip_family = socket.AF_INET6 
         ip_byte_length = 16
     elif 'peers' in tracker_response_decoded :
-        # ipv6 format 18 bytes , 16 for the ipv6 and 2 bytes for port 
+        # ipv4  format 6 bytes , 4 bytes for ipv4 and 2 bytes for the port
         peers_bytes = tracker_response_decoded['peers']
         chunk_size =  6 
         ip_family = socket.AF_INET
@@ -26,7 +26,7 @@ def parse_peer_list( tracker_response_decoded ) :
         ip_bytes = chunk[:ip_byte_length]
         port_bytes = chunk[ip_byte_length:] 
 
-        print(ip_bytes , port_bytes)
+        print("ip_bytes , port_bytesj",ip_bytes , port_bytes)
 
         try :
             # convert the ip bytes into ip adddress string
