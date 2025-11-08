@@ -145,3 +145,4 @@ Peers choose who to upload to based on who uploads to them.
 | You don’t upload → others choke you → slow downloads ❌ |
 
 This creates mutual benefit.
+- This must be inspired from the game theory
