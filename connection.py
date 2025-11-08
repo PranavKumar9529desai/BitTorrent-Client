@@ -177,8 +177,8 @@ async def async_exchange_messages(reader, writer, info_dict, peer_ip, timeout=30
         await writer.drain()
         print(f"[{peer_ip}] Sent INTERESTED message")
         
-        # Message exchange loop
-        while True:
+        # Message exchange loop - continue until all pieces are downloaded
+        while len(pieces_completed) < pieces_to_download:
             # Read data into buffer (async)
             try:
                 data = await asyncio.wait_for(reader.read(4096), timeout=timeout)
@@ -187,8 +187,23 @@ async def async_exchange_messages(reader, writer, info_dict, peer_ip, timeout=30
                     break
                 buffer += data
             except asyncio.TimeoutError:
-                print(f"[{peer_ip}] Timeout waiting for messages")
-                break
+                # Check if we've completed all pieces before breaking
+                if len(pieces_completed) >= pieces_to_download:
+                    print(f"[{peer_ip}] All pieces completed!")
+                    break
+                # If we still have pieces to download, continue (maybe peer is slow)
+                # But also check if we're making progress
+                if len(pieces_downloading) == 0 and len(pieces_completed) < pieces_to_download:
+                    # No pieces downloading and not all completed - might be stuck
+                    print(f"[{peer_ip}] Timeout waiting for messages, but still need {pieces_to_download - len(pieces_completed)} pieces")
+                    # Try to request more pieces if we're unchoked
+                    if unchoked and bitfield:
+                        await async_request_initial_blocks(writer, bitfield, piece_length, num_pieces, 
+                                                          pieces_received, blocks_requested, pieces_downloading,
+                                                          pieces_completed, pieces_to_download, block_size, 
+                                                          shared_state, peer_ip)
+                # Continue the loop instead of breaking
+                continue
             
             # Process all complete messages in buffer
             while True:
@@ -272,6 +287,10 @@ async def async_exchange_messages(reader, writer, info_dict, peer_ip, timeout=30
                 else:
                     # Other messages (have, not interested, etc.) - just log
                     pass
+        
+        # Check if we completed all pieces
+        if len(pieces_completed) >= pieces_to_download:
+            print(f"[{peer_ip}] ✓ All {pieces_to_download} pieces completed!")
         
         return {
             'bitfield': bitfield,
@@ -502,9 +521,10 @@ async def async_connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir=
         print(f"[{peer['ip']}] Connection closed")
 
 
-async def connect(peer_list, info_hash, peer_id, info_dict, pieces_dir='pieces', max_pieces=None, max_peers=5):
+async def connect(peer_list, info_hash, peer_id, info_dict, pieces_dir='pieces', max_pieces=None, max_peers=3):
     """
     Attempts to connect to multiple peers simultaneously using asyncio.
+    If initial peers fail, retries with next peers from the list.
     
     Args:
         peer_list: list - List of peer dicts
@@ -513,7 +533,7 @@ async def connect(peer_list, info_hash, peer_id, info_dict, pieces_dir='pieces',
         info_dict: dict - Torrent info dictionary
         pieces_dir: str - Directory to save pieces
         max_pieces: int - Maximum pieces to download (None = all)
-        max_peers: int - Maximum number of peers to connect to simultaneously (default 5)
+        max_peers: int - Maximum number of peers to connect to simultaneously (default 3)
     
     Returns:
         dict - Results from first successful peer connection, or None if all fail
@@ -523,48 +543,127 @@ async def connect(peer_list, info_hash, peer_id, info_dict, pieces_dir='pieces',
         'pieces_completed': set(get_saved_pieces(pieces_dir)),
         'pieces_downloading': set(),
         'lock': asyncio.Lock(),
-        'results': []
+        'active_connections': []  # Track active connections
     }
     
-    # Select peers to connect to
-    peers_to_connect = min(max_peers, len(peer_list))
+    peer_index = 0
+    successful_connections = []
+    running_tasks = []  # Track tasks that are still running (successful connections)
+    max_retries = 3  # Try up to 3 batches of peers
     
     print(f"\n{'='*60}")
-    print(f"Starting {peers_to_connect} peer connections simultaneously...")
+    print(f"Connecting to peers (trying {max_peers} at a time, up to {max_retries} batches)...")
     print(f"{'='*60}")
     
-    # Create tasks for all peers
-    tasks = []
-    for peer in peer_list[:peers_to_connect]:
-        task = asyncio.create_task(
-            async_connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir, max_pieces, shared_state)
-        )
-        tasks.append(task)
+    for batch in range(max_retries):
+        if peer_index >= len(peer_list):
+            print(f"\nNo more peers to try (tried {peer_index} peers)")
+            break
+        
+        # Select next batch of peers
+        batch_peers = peer_list[peer_index:peer_index + max_peers]
+        peer_index += max_peers
+        
+        print(f"\nBatch {batch + 1}: Trying {len(batch_peers)} peers...")
+        
+        # Create tasks for this batch
+        tasks = []
+        for peer in batch_peers:
+            task = asyncio.create_task(
+                async_connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir, max_pieces, shared_state)
+            )
+            tasks.append((task, peer))
+        
+        # Wait a short time to see if any connections establish
+        # We check if tasks are still running after handshake (successful connection)
+        # vs completed quickly (failed connection)
+        try:
+            # Wait 10 seconds to see connection status
+            await asyncio.sleep(10)
+            
+            # Check which tasks are still running (likely successful connections)
+            # vs completed (likely failed connections)
+            batch_success = False
+            batch_running_tasks = []
+            
+            for task, peer in tasks:
+                if task.done():
+                    # Task completed - check if it was successful
+                    try:
+                        result = await task
+                        if result:
+                            successful_connections.append((peer, result))
+                            batch_success = True
+                            print(f"[{peer['ip']}] ✓ Connection successful and completed!")
+                    except Exception:
+                        pass  # Failed connection, already logged
+                else:
+                    # Task still running - likely a successful connection that's downloading
+                    batch_running_tasks.append((task, peer))
+                    batch_success = True
+                    print(f"[{peer['ip']}] ✓ Connection established and downloading...")
+            
+            # If we got at least one successful connection, keep those running
+            if batch_success:
+                running_tasks.extend(batch_running_tasks)  # Add to global running tasks
+                print(f"\n✓ Got {len(successful_connections) + len(running_tasks)} successful connection(s)!")
+                # Keep running tasks alive - they'll continue downloading
+                # They coordinate via shared_state
+                break
+            else:
+                # Cancel any pending tasks from this batch
+                for task, peer in tasks:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                
+                print(f"Batch {batch + 1} failed - trying next batch...")
+                
+        except Exception as e:
+            print(f"Error in batch {batch + 1}: {e}")
+            # Cancel all tasks in this batch
+            for task, peer in tasks:
+                if not task.done():
+                    task.cancel()
+            continue
     
-    # Wait for all tasks to complete (they run concurrently)
-    # Use asyncio.gather with return_exceptions to get all results
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Find first successful result
-    successful_result = None
-    completed_count = 0
-    
-    for i, result in enumerate(results):
-        peer = peer_list[i] if i < len(peer_list) else None
-        if isinstance(result, Exception):
-            if peer:
-                print(f"[{peer['ip']}] Connection error: {result}")
-        elif result:
-            completed_count += 1
-            if successful_result is None:
-                successful_result = result
-                if peer:
-                    print(f"\n[{peer['ip']}] First successful connection!")
-    
-    print(f"\nCompleted: {completed_count}/{peers_to_connect} peer connections")
-    
-    # Keep connections running - don't cancel them, let them continue downloading
-    # The shared state will coordinate piece downloads across all peers
-    
-    return successful_result
+    # If we have successful connections (either completed or still running), wait for downloads
+    if successful_connections or running_tasks:
+        total_connections = len(successful_connections) + len(running_tasks)
+        print(f"\n{'='*60}")
+        print(f"Waiting for downloads to complete ({total_connections} active connection(s))...")
+        print(f"{'='*60}")
+        
+        # Wait for at least one running task to complete, or use a completed one
+        if running_tasks:
+            # Wait for first running task to complete
+            task, peer = running_tasks[0]
+            try:
+                result = await task
+                if result:
+                    return result
+            except Exception as e:
+                print(f"[{peer['ip']}] Connection ended with error: {e}")
+                # Try next running task if available
+                if len(running_tasks) > 1:
+                    task, peer = running_tasks[1]
+                    try:
+                        result = await task
+                        if result:
+                            return result
+                    except Exception:
+                        pass
+        
+        # If we have a completed connection, return it
+        if successful_connections:
+            return successful_connections[0][1]
+        
+        # If all failed, return None
+        return None
+    else:
+        print(f"\n✗ Failed to connect to any peers after trying {peer_index} peers")
+        return None
 

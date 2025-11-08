@@ -70,7 +70,7 @@ pieces_dir = 'pieces'
 
 # Run async connect function
 result = asyncio.run(connect(peer_list_parsed, info_hash, peer_id, info_dict_decoded, 
-                            pieces_dir=pieces_dir, max_peers=5))
+                            pieces_dir=pieces_dir, max_peers=3))
 
 if result:
     print("\n" + "="*60)
