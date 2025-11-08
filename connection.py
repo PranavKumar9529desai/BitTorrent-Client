@@ -7,10 +7,12 @@ Uses asyncio for concurrent multi-peer downloading.
 import socket
 import struct
 import asyncio
+import time
 from handshake import construct_handshake, validate_handshake
 from messages import (
     create_interested, create_request, parse_message, parse_bitfield,
-    parse_piece, MSG_BITFIELD, MSG_UNCHOKE, MSG_PIECE, MSG_CHOKE
+    parse_piece, MSG_BITFIELD, MSG_UNCHOKE, MSG_PIECE, MSG_CHOKE,
+    create_keep_alive
 )
 from piece_manager import get_saved_pieces, is_piece_complete
 
@@ -170,6 +172,10 @@ async def async_exchange_messages(reader, writer, info_dict, peer_ip, timeout=30
             pieces_completed = shared_state['pieces_completed'].copy()
             pieces_downloading = shared_state['pieces_downloading'].copy()
     
+    # Keep-alive mechanism: send keep-alive every 2 minutes
+    last_keepalive = time.time()
+    keepalive_interval = 120  # 2 minutes
+    
     try:
         # Send interested message
         interested_msg = create_interested()
@@ -179,14 +185,31 @@ async def async_exchange_messages(reader, writer, info_dict, peer_ip, timeout=30
         
         # Message exchange loop - continue until all pieces are downloaded
         while len(pieces_completed) < pieces_to_download:
+            # Send keep-alive if needed
+            current_time = time.time()
+            if current_time - last_keepalive >= keepalive_interval:
+                keepalive_msg = create_keep_alive()
+                writer.write(keepalive_msg)
+                await writer.drain()
+                last_keepalive = current_time
             # Read data into buffer (async)
+            # Use shorter timeout for reading, but check keep-alive separately
+            read_timeout = min(60, timeout)  # Max 60 seconds for reading
             try:
-                data = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+                data = await asyncio.wait_for(reader.read(4096), timeout=read_timeout)
                 if not data:
                     print(f"[{peer_ip}] Connection closed by peer")
                     break
                 buffer += data
             except asyncio.TimeoutError:
+                # Send keep-alive on timeout to maintain connection
+                current_time = time.time()
+                if current_time - last_keepalive >= keepalive_interval:
+                    keepalive_msg = create_keep_alive()
+                    writer.write(keepalive_msg)
+                    await writer.drain()
+                    last_keepalive = current_time
+                
                 # Check if we've completed all pieces before breaking
                 if len(pieces_completed) >= pieces_to_download:
                     print(f"[{peer_ip}] All pieces completed!")
@@ -637,25 +660,26 @@ async def connect(peer_list, info_hash, peer_id, info_dict, pieces_dir='pieces',
         print(f"Waiting for downloads to complete ({total_connections} active connection(s))...")
         print(f"{'='*60}")
         
-        # Wait for at least one running task to complete, or use a completed one
+        # Wait for all running tasks to complete (or fail)
+        # Use asyncio.gather to wait for all, but don't fail if one fails
         if running_tasks:
-            # Wait for first running task to complete
-            task, peer = running_tasks[0]
+            # Wait for all tasks, collecting results
+            tasks_to_wait = [task for task, _ in running_tasks]
             try:
-                result = await task
-                if result:
-                    return result
+                # Wait for all tasks with return_exceptions=True so one failure doesn't stop others
+                results = await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+                
+                # Check results
+                for i, result in enumerate(results):
+                    peer = running_tasks[i][1]
+                    if isinstance(result, Exception):
+                        print(f"[{peer['ip']}] Connection ended with error: {result}")
+                    elif result:
+                        print(f"[{peer['ip']}] ✓ Connection completed successfully")
+                        # Return first successful result
+                        return result
             except Exception as e:
-                print(f"[{peer['ip']}] Connection ended with error: {e}")
-                # Try next running task if available
-                if len(running_tasks) > 1:
-                    task, peer = running_tasks[1]
-                    try:
-                        result = await task
-                        if result:
-                            return result
-                    except Exception:
-                        pass
+                print(f"Error waiting for tasks: {e}")
         
         # If we have a completed connection, return it
         if successful_connections:
