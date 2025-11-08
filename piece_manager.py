@@ -47,6 +47,44 @@ def verify_piece(piece_index, piece_data, expected_hash):
         return False
 
 
+def is_piece_complete(pieces_dict, piece_index, expected_piece_length):
+    """
+    Checks if a piece is complete (has all blocks).
+    
+    Args:
+        pieces_dict: dict - {piece_index: {offset: data}}
+        piece_index: int - Index of piece to check
+        expected_piece_length: int - Expected total length of piece
+    
+    Returns:
+        bool - True if piece is complete
+    """
+    if piece_index not in pieces_dict:
+        return False
+    
+    blocks = pieces_dict[piece_index]
+    if not blocks:
+        return False
+    
+    # Calculate total size of received blocks
+    total_size = sum(len(data) for data in blocks.values())
+    
+    # Check if we have the expected size (allow small difference for last piece)
+    if total_size < expected_piece_length - 100:  # Allow 100 bytes tolerance
+        return False
+    
+    # Check if blocks are sequential (no gaps)
+    sorted_offsets = sorted(blocks.keys())
+    expected_offset = 0
+    
+    for offset in sorted_offsets:
+        if offset != expected_offset:
+            return False  # Gap in blocks
+        expected_offset += len(blocks[offset])
+    
+    return True
+
+
 def assemble_piece(pieces_dict, piece_index):
     """
     Assembles a complete piece from received blocks.
@@ -83,7 +121,7 @@ def assemble_piece(pieces_dict, piece_index):
     return piece_data
 
 
-def verify_and_save_piece(piece_index, pieces_dict, piece_hashes, output_dir='.'):
+def verify_and_save_piece(piece_index, pieces_dict, piece_hashes, piece_length=262144, output_dir='.'):
     """
     Assembles, verifies, and saves a piece to disk.
     
@@ -91,6 +129,7 @@ def verify_and_save_piece(piece_index, pieces_dict, piece_hashes, output_dir='.'
         piece_index: int - Index of piece
         pieces_dict: dict - Dictionary of received pieces
         piece_hashes: list - List of expected piece hashes
+        piece_length: int - Expected length of piece (default 256 KB)
         output_dir: str - Directory to save pieces
     
     Returns:
@@ -98,6 +137,11 @@ def verify_and_save_piece(piece_index, pieces_dict, piece_hashes, output_dir='.'
     """
     if piece_index >= len(piece_hashes):
         print(f"Invalid piece index: {piece_index}")
+        return False
+    
+    # Check if piece is complete first
+    if not is_piece_complete(pieces_dict, piece_index, piece_length):
+        print(f"Piece {piece_index} is incomplete - skipping verification")
         return False
     
     # Assemble piece

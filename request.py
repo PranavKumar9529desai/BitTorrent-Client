@@ -6,7 +6,7 @@ import requests
 from parse_peers_list import parse_peer_list
 from handshake import construct_handshake
 from connection import connect
-from piece_manager import get_piece_hashes, verify_and_save_piece
+from piece_manager import get_piece_hashes, verify_and_save_piece, is_piece_complete
 
 
 # peer-id 
@@ -73,13 +73,26 @@ if result:
     
     # Get piece hashes for verification
     piece_hashes = get_piece_hashes()
+    piece_length = info_dict_decoded.get('piece length', 262144)
     print(f"\nLoaded {len(piece_hashes)} piece hashes for verification")
+    print(f"Piece length: {piece_length} bytes ({piece_length // 1024} KB)")
     
     # Verify received pieces
     if result.get('pieces'):
-        print(f"\nVerifying received pieces...")
+        print(f"\nChecking received pieces...")
+        complete_pieces = 0
+        incomplete_pieces = 0
         for piece_index in result['pieces'].keys():
-            verify_and_save_piece(piece_index, result['pieces'], piece_hashes)
+            if is_piece_complete(result['pieces'], piece_index, piece_length):
+                complete_pieces += 1
+                verify_and_save_piece(piece_index, result['pieces'], piece_hashes, piece_length)
+            else:
+                incomplete_pieces += 1
+                blocks_received = len(result['pieces'][piece_index])
+                total_size = sum(len(data) for data in result['pieces'][piece_index].values())
+                print(f"Piece {piece_index} incomplete: {blocks_received} blocks, {total_size}/{piece_length} bytes")
+        
+        print(f"\nSummary: {complete_pieces} complete pieces, {incomplete_pieces} incomplete pieces")
     else:
         print("No pieces received yet")
 else:

@@ -128,6 +128,8 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
     bitfield = None
     unchoked = False
     pieces_received = {}  # {piece_index: {offset: data}}
+    blocks_requested = {}  # {piece_index: set(offsets)} - Track requested blocks
+    block_size = 16384  # 16 KB blocks
     
     # Calculate piece length
     piece_length = info_dict.get('piece length', 262144)  # Default 256 KB
@@ -137,7 +139,8 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
     else:
         num_pieces = 0
     
-    print(f"Starting message exchange (expecting {num_pieces} pieces)")
+    print(f"Starting message exchange (expecting {num_pieces} pieces, {piece_length} bytes each)")
+    print(f"Each piece needs {piece_length // block_size} blocks of {block_size} bytes")
     
     try:
         # Send interested message
@@ -184,7 +187,8 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
                     
                     # Start requesting pieces if we have bitfield
                     if bitfield:
-                        request_pieces(peer_socket, bitfield, piece_length, num_pieces, pieces_received)
+                        request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces, 
+                                             pieces_received, blocks_requested, block_size)
                 
                 # Handle choke
                 elif message_id == MSG_CHOKE:
@@ -197,7 +201,17 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
                     if piece_index not in pieces_received:
                         pieces_received[piece_index] = {}
                     pieces_received[piece_index][block_offset] = block_data
+                    
+                    # Remove from requested set (we received it)
+                    if piece_index in blocks_requested and block_offset in blocks_requested[piece_index]:
+                        blocks_requested[piece_index].discard(block_offset)
+                    
                     print(f"Received PIECE {piece_index} block at offset {block_offset} ({len(block_data)} bytes)")
+                    
+                    # Check if we need to request more blocks for this piece
+                    if unchoked and bitfield and bitfield[piece_index]:
+                        request_next_blocks(peer_socket, piece_index, piece_length, num_pieces,
+                                          pieces_received, blocks_requested, block_size)
                 
                 else:
                     print(f"Received message ID: {message_id}")
@@ -214,9 +228,10 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
         return None
 
 
-def request_pieces(peer_socket, bitfield, piece_length, num_pieces, pieces_received, block_size=16384):
+def request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces, 
+                          pieces_received, blocks_requested, block_size=16384):
     """
-    Requests pieces from peer based on bitfield.
+    Requests initial blocks from first few pieces that peer has.
     
     Args:
         peer_socket: socket - Connected socket
@@ -224,27 +239,91 @@ def request_pieces(peer_socket, bitfield, piece_length, num_pieces, pieces_recei
         piece_length: int - Length of each piece
         num_pieces: int - Total number of pieces
         pieces_received: dict - Dictionary to store received pieces
+        blocks_requested: dict - Dictionary to track requested blocks
         block_size: int - Size of each block to request (default 16 KB)
     """
     if not bitfield:
         return
     
-    # Request first few pieces that peer has
+    # Request first block of first few pieces that peer has
     requested = 0
-    max_concurrent = 5  # Don't request too many at once
+    max_concurrent_pieces = 3  # Start with 3 pieces
     
     for piece_index in range(min(num_pieces, len(bitfield))):
-        if bitfield[piece_index] and requested < max_concurrent:
-            # Request first block of this piece
-            # Note: Last piece might be smaller, but we'll handle that when receiving
+        if bitfield[piece_index] and requested < max_concurrent_pieces:
+            # Initialize tracking
+            if piece_index not in blocks_requested:
+                blocks_requested[piece_index] = set()
+            if piece_index not in pieces_received:
+                pieces_received[piece_index] = {}
+            
+            # Request first block (offset 0)
             request_length = min(block_size, piece_length)
             request_msg = create_request(piece_index, 0, request_length)
             peer_socket.sendall(request_msg)
-            print(f"Requested piece {piece_index}, block 0 ({request_length} bytes)")
+            blocks_requested[piece_index].add(0)
+            print(f"Requested piece {piece_index}, block 0 (offset 0, {request_length} bytes)")
             requested += 1
             
-            if requested >= max_concurrent:
+            if requested >= max_concurrent_pieces:
                 break
+
+
+def request_next_blocks(peer_socket, piece_index, piece_length, num_pieces,
+                        pieces_received, blocks_requested, block_size=16384):
+    """
+    Continues requesting more blocks for a piece as blocks are received.
+    
+    Args:
+        peer_socket: socket - Connected socket
+        piece_index: int - Index of piece to continue requesting
+        piece_length: int - Length of each piece
+        num_pieces: int - Total number of pieces
+        pieces_received: dict - Dictionary of received blocks
+        blocks_requested: dict - Dictionary tracking requested blocks
+        block_size: int - Size of each block
+    """
+    if piece_index not in pieces_received:
+        return
+    
+    # Calculate how many blocks this piece needs
+    if piece_index == num_pieces - 1:
+        # Last piece might be smaller - we'll calculate from total size
+        # For now, use piece_length (we'll handle last piece specially later)
+        blocks_needed = (piece_length + block_size - 1) // block_size
+    else:
+        blocks_needed = piece_length // block_size
+    
+    # Get blocks we already have
+    received_offsets = set(pieces_received[piece_index].keys())
+    
+    # Find next block to request
+    for block_num in range(blocks_needed):
+        offset = block_num * block_size
+        
+        # Skip if we already have this block
+        if offset in received_offsets:
+            continue
+        
+        # Skip if we already requested this block
+        if piece_index in blocks_requested and offset in blocks_requested[piece_index]:
+            continue
+        
+        # Calculate request length (last block might be smaller)
+        remaining = piece_length - offset
+        request_length = min(block_size, remaining)
+        
+        # Request this block
+        request_msg = create_request(piece_index, offset, request_length)
+        peer_socket.sendall(request_msg)
+        
+        # Track that we requested it
+        if piece_index not in blocks_requested:
+            blocks_requested[piece_index] = set()
+        blocks_requested[piece_index].add(offset)
+        
+        print(f"Requested piece {piece_index}, block {block_num} (offset {offset}, {request_length} bytes)")
+        break  # Request one block at a time
 
 
 def connect_to_peer(peer, info_hash, peer_id, info_dict):
