@@ -1,0 +1,16 @@
+# Pieces directory - downloaded pieces
+pieces/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Downloaded files (when we implement file assembly)
+downloads/
+
+# Progress/state files (for resume capability)
+*.progress
+*.state
+

@@ -6,7 +6,7 @@ import requests
 from parse_peers_list import parse_peer_list
 from handshake import construct_handshake
 from connection import connect
-from piece_manager import get_piece_hashes, verify_and_save_piece, is_piece_complete
+from piece_manager import get_piece_hashes, verify_and_save_piece, is_piece_complete, get_saved_pieces
 
 
 # peer-id 
@@ -77,15 +77,25 @@ if result:
     print(f"\nLoaded {len(piece_hashes)} piece hashes for verification")
     print(f"Piece length: {piece_length} bytes ({piece_length // 1024} KB)")
     
-    # Verify received pieces
+    # Check for already saved pieces
+    pieces_dir = 'pieces'
+    saved_pieces_set = get_saved_pieces(pieces_dir)
+    if saved_pieces_set:
+        print(f"Found {len(saved_pieces_set)} pieces already saved on disk")
+    
+    # Verify and save received pieces
     if result.get('pieces'):
         print(f"\nChecking received pieces...")
+        print(f"Pieces will be saved to: {pieces_dir}/")
         complete_pieces = 0
         incomplete_pieces = 0
+        saved_pieces = 0
+        
         for piece_index in result['pieces'].keys():
             if is_piece_complete(result['pieces'], piece_index, piece_length):
                 complete_pieces += 1
-                verify_and_save_piece(piece_index, result['pieces'], piece_hashes, piece_length)
+                if verify_and_save_piece(piece_index, result['pieces'], piece_hashes, piece_length, pieces_dir):
+                    saved_pieces += 1
             else:
                 incomplete_pieces += 1
                 blocks_received = len(result['pieces'][piece_index])
@@ -93,6 +103,7 @@ if result:
                 print(f"Piece {piece_index} incomplete: {blocks_received} blocks, {total_size}/{piece_length} bytes")
         
         print(f"\nSummary: {complete_pieces} complete pieces, {incomplete_pieces} incomplete pieces")
+        print(f"Saved {saved_pieces} pieces to disk in '{pieces_dir}/' directory")
     else:
         print("No pieces received yet")
 else:
