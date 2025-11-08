@@ -2,9 +2,11 @@
 BitTorrent Peer Connection Handler
 
 Handles TCP connection, handshake, and Peer Wire Protocol message exchange.
+Uses asyncio for concurrent multi-peer downloading.
 """
 import socket
 import struct
+import asyncio
 from handshake import construct_handshake, validate_handshake
 from messages import (
     create_interested, create_request, parse_message, parse_bitfield,
@@ -29,34 +31,37 @@ def detect_ip_family(ip_address):
         return socket.AF_INET
 
 
-def receive_exact(sock, length, timeout=30):
+async def async_receive_exact(reader, length, timeout=30):
     """
-    Receives exactly 'length' bytes from socket.
+    Receives exactly 'length' bytes from async reader.
     
     Args:
-        sock: socket - Socket to receive from
+        reader: asyncio.StreamReader - Async reader
         length: int - Number of bytes to receive
         timeout: int - Timeout in seconds
     
     Returns:
         bytes - Received data, or None if incomplete/timeout
     """
-    sock.settimeout(timeout)
     data = b''
-    while len(data) < length:
-        try:
-            chunk = sock.recv(length - len(data))
+    try:
+        while len(data) < length:
+            remaining = length - len(data)
+            chunk = await asyncio.wait_for(reader.read(remaining), timeout=timeout)
             if not chunk:
                 return None  # Connection closed
             data += chunk
-        except socket.timeout:
-            return None
-    return data
+        return data
+    except asyncio.TimeoutError:
+        return None
+    except Exception as e:
+        print(f"Error receiving data: {e}")
+        return None
 
 
-def connect_and_handshake(peer, info_hash, peer_id, timeout=10):
+async def async_connect_and_handshake(peer, info_hash, peer_id, timeout=10):
     """
-    Connects to a peer, performs handshake, and returns the socket if successful.
+    Connects to a peer, performs handshake, and returns reader/writer if successful.
     
     Args:
         peer: dict - {'ip': str, 'port': int}
@@ -65,75 +70,75 @@ def connect_and_handshake(peer, info_hash, peer_id, timeout=10):
         timeout: int - Connection timeout in seconds
     
     Returns:
-        tuple: (socket, peer_peer_id) if successful, (None, None) if failed
+        tuple: (reader, writer, peer_peer_id) if successful, (None, None, None) if failed
     """
-    peer_socket = None
-    ip_family = detect_ip_family(peer['ip'])
-    
     try:
-        print(f"Connecting to {peer['ip']}:{peer['port']}")
+        print(f"[{peer['ip']}] Connecting...")
         
-        # Create socket
-        peer_socket = socket.socket(ip_family, socket.SOCK_STREAM)
-        peer_socket.settimeout(timeout)
-        
-        # TCP connection
-        peer_socket.connect((peer['ip'], peer['port']))
-        print(f"TCP connection established")
+        # Async TCP connection
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(peer['ip'], peer['port']),
+            timeout=timeout
+        )
+        print(f"[{peer['ip']}] TCP connection established")
         
         # Send handshake
         handshake_msg = construct_handshake(info_hash, peer_id)
-        peer_socket.sendall(handshake_msg)
-        print("Handshake sent")
+        writer.write(handshake_msg)
+        await writer.drain()
+        print(f"[{peer['ip']}] Handshake sent")
         
         # Receive handshake response
-        handshake_response = receive_exact(peer_socket, 68, timeout)
+        handshake_response = await async_receive_exact(reader, 68, timeout)
         if not handshake_response:
-            print("Failed to receive handshake response")
-            return None, None
+            print(f"[{peer['ip']}] Failed to receive handshake response")
+            writer.close()
+            await writer.wait_closed()
+            return None, None, None
         
         # Validate handshake
         is_valid, peer_peer_id = validate_handshake(handshake_response, info_hash)
         if not is_valid:
-            print("Handshake validation failed - wrong torrent")
-            return None, None
+            print(f"[{peer['ip']}] Handshake validation failed - wrong torrent")
+            writer.close()
+            await writer.wait_closed()
+            return None, None, None
         
-        print(f"Handshake successful! Peer ID: {peer_peer_id.hex()[:8]}...")
-        return peer_socket, peer_peer_id
+        print(f"[{peer['ip']}] Handshake successful! Peer ID: {peer_peer_id.hex()[:8]}...")
+        return reader, writer, peer_peer_id
         
-    except socket.timeout:
-        print(f"Connection/handshake timeout")
-        return None, None
-    except socket.error as e:
-        print(f"Connection failed: {e}")
-        return None, None
+    except asyncio.TimeoutError:
+        print(f"[{peer['ip']}] Connection/handshake timeout")
+        return None, None, None
     except Exception as e:
-        print(f"Unexpected error: {e}")
-        return None, None
+        print(f"[{peer['ip']}] Connection failed: {e}")
+        return None, None, None
 
 
-def exchange_messages(peer_socket, info_dict, timeout=30, pieces_dir='pieces', max_pieces_to_download=None):
+async def async_exchange_messages(reader, writer, info_dict, peer_ip, timeout=30, pieces_dir='pieces', max_pieces_to_download=None, shared_state=None):
     """
-    Exchanges Peer Wire Protocol messages with a peer.
+    Exchanges Peer Wire Protocol messages with a peer (async version).
     
     Args:
-        peer_socket: socket - Connected socket
+        reader: asyncio.StreamReader - Async reader
+        writer: asyncio.StreamWriter - Async writer
         info_dict: dict - Torrent info dictionary (for piece length)
+        peer_ip: str - Peer IP address for logging
         timeout: int - Message timeout in seconds
         pieces_dir: str - Directory where pieces are saved
         max_pieces_to_download: int - Maximum pieces to download (None = all)
+        shared_state: dict - Shared state for multi-peer coordination (optional)
     
     Returns:
         dict - {'bitfield': list, 'pieces': dict} or None if failed
     """
-    peer_socket.settimeout(timeout)
     buffer = b''
     bitfield = None
     unchoked = False
     pieces_received = {}  # {piece_index: {offset: data}}
     blocks_requested = {}  # {piece_index: set(offsets)} - Track requested blocks
     block_size = 16384  # 16 KB blocks
-    max_concurrent_pieces = 5  # Download up to 5 pieces concurrently
+    max_concurrent_pieces = 15  # Download up to 15 pieces concurrently (increased for speed)
     
     # Calculate piece length
     piece_length = info_dict.get('piece length', 262144)  # Default 256 KB
@@ -159,23 +164,30 @@ def exchange_messages(peer_socket, info_dict, timeout=30, pieces_dir='pieces', m
     pieces_downloading = set()  # Track which pieces we're currently downloading
     pieces_completed = set(saved_pieces)  # Track completed pieces (including saved ones)
     
+    # Use shared state if provided (for multi-peer downloading)
+    if shared_state:
+        async with shared_state['lock']:
+            pieces_completed = shared_state['pieces_completed'].copy()
+            pieces_downloading = shared_state['pieces_downloading'].copy()
+    
     try:
         # Send interested message
         interested_msg = create_interested()
-        peer_socket.sendall(interested_msg)
-        print("Sent INTERESTED message")
+        writer.write(interested_msg)
+        await writer.drain()
+        print(f"[{peer_ip}] Sent INTERESTED message")
         
         # Message exchange loop
         while True:
-            # Read data into buffer
+            # Read data into buffer (async)
             try:
-                data = peer_socket.recv(4096)
+                data = await asyncio.wait_for(reader.read(4096), timeout=timeout)
                 if not data:
-                    print("Connection closed by peer")
+                    print(f"[{peer_ip}] Connection closed by peer")
                     break
                 buffer += data
-            except socket.timeout:
-                print("Timeout waiting for messages")
+            except asyncio.TimeoutError:
+                print(f"[{peer_ip}] Timeout waiting for messages")
                 break
             
             # Process all complete messages in buffer
@@ -195,23 +207,24 @@ def exchange_messages(peer_socket, info_dict, timeout=30, pieces_dir='pieces', m
                 if message_id == MSG_BITFIELD:
                     bitfield = parse_bitfield(payload)
                     available_pieces = sum(bitfield)
-                    print(f"Received BITFIELD: {available_pieces}/{num_pieces} pieces available")
+                    print(f"[{peer_ip}] Received BITFIELD: {available_pieces}/{num_pieces} pieces available")
                 
                 # Handle unchoke
                 elif message_id == MSG_UNCHOKE:
                     unchoked = True
-                    print("Received UNCHOKE - can now request pieces!")
+                    print(f"[{peer_ip}] Received UNCHOKE - can now request pieces!")
                     
                     # Start requesting pieces if we have bitfield
                     if bitfield:
-                        request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces, 
-                                             pieces_received, blocks_requested, pieces_downloading,
-                                             pieces_completed, pieces_to_download, block_size)
+                        await async_request_initial_blocks(writer, bitfield, piece_length, num_pieces, 
+                                                          pieces_received, blocks_requested, pieces_downloading,
+                                                          pieces_completed, pieces_to_download, block_size, 
+                                                          shared_state, peer_ip)
                 
                 # Handle choke
                 elif message_id == MSG_CHOKE:
                     unchoked = False
-                    print("Received CHOKE - peer stopped sending data")
+                    print(f"[{peer_ip}] Received CHOKE - peer stopped sending data")
                 
                 # Handle piece
                 elif message_id == MSG_PIECE:
@@ -229,26 +242,36 @@ def exchange_messages(peer_socket, info_dict, timeout=30, pieces_dir='pieces', m
                         if piece_index not in pieces_completed:
                             pieces_completed.add(piece_index)
                             pieces_downloading.discard(piece_index)
-                            print(f"✓ Piece {piece_index} completed! ({len(pieces_completed)}/{pieces_to_download} pieces)")
+                            
+                            # Update shared state if available
+                            if shared_state:
+                                async with shared_state['lock']:
+                                    shared_state['pieces_completed'].add(piece_index)
+                                    shared_state['pieces_downloading'].discard(piece_index)
+                            
+                            print(f"[{peer_ip}] ✓ Piece {piece_index} completed! ({len(pieces_completed)}/{pieces_to_download} pieces)")
                             
                             # Request next piece if we have room
                             if unchoked and bitfield and len(pieces_downloading) < max_concurrent_pieces:
-                                request_next_available_piece(peer_socket, bitfield, piece_length, num_pieces,
-                                                           pieces_received, blocks_requested, pieces_downloading,
-                                                           pieces_completed, pieces_to_download, block_size)
+                                await async_request_next_available_piece(writer, bitfield, piece_length, num_pieces,
+                                                                        pieces_received, blocks_requested, pieces_downloading,
+                                                                        pieces_completed, pieces_to_download, block_size,
+                                                                        shared_state, peer_ip)
                     else:
                         # Show progress for incomplete pieces (less verbose)
                         if len(pieces_received[piece_index]) % 4 == 0:  # Print every 4 blocks
                             blocks_received = len(pieces_received[piece_index])
-                            print(f"Piece {piece_index}: {blocks_received} blocks received")
+                            # Only print occasionally to reduce spam
+                            pass
                     
                     # Check if we need to request more blocks for this piece
                     if unchoked and bitfield and bitfield[piece_index]:
-                        request_next_blocks(peer_socket, piece_index, piece_length, num_pieces,
-                                          pieces_received, blocks_requested, block_size)
+                        await async_request_next_blocks(writer, piece_index, piece_length, num_pieces,
+                                                        pieces_received, blocks_requested, block_size, peer_ip)
                 
                 else:
-                    print(f"Received message ID: {message_id}")
+                    # Other messages (have, not interested, etc.) - just log
+                    pass
         
         return {
             'bitfield': bitfield,
@@ -256,20 +279,21 @@ def exchange_messages(peer_socket, info_dict, timeout=30, pieces_dir='pieces', m
         }
         
     except Exception as e:
-        print(f"Error in message exchange: {e}")
+        print(f"[{peer_ip}] Error in message exchange: {e}")
         import traceback
         traceback.print_exc()
         return None
 
 
-def request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces, 
-                          pieces_received, blocks_requested, pieces_downloading,
-                          pieces_completed, pieces_to_download, block_size=16384):
+async def async_request_initial_blocks(writer, bitfield, piece_length, num_pieces, 
+                                      pieces_received, blocks_requested, pieces_downloading,
+                                      pieces_completed, pieces_to_download, block_size, 
+                                      shared_state, peer_ip):
     """
-    Requests initial blocks from first available pieces that peer has.
+    Requests initial blocks from first available pieces that peer has (async version).
     
     Args:
-        peer_socket: socket - Connected socket
+        writer: asyncio.StreamWriter - Async writer
         bitfield: list - List of booleans indicating available pieces
         piece_length: int - Length of each piece
         num_pieces: int - Total number of pieces
@@ -279,15 +303,29 @@ def request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces,
         pieces_completed: set - Set of piece indices already completed
         pieces_to_download: int - Total number of pieces to download
         block_size: int - Size of each block to request (default 16 KB)
+        shared_state: dict - Shared state for multi-peer coordination
+        peer_ip: str - Peer IP for logging
     """
     if not bitfield:
         return
     
-    max_concurrent = 5  # Start with 5 pieces concurrently
+    max_concurrent = 15  # Start with 15 pieces concurrently (increased for speed)
     
     # Find pieces to download (not already completed, peer has them, not already downloading)
     for piece_index in range(min(pieces_to_download, len(bitfield))):
-        if (piece_index not in pieces_completed and 
+        # Check shared state if available
+        can_download = True
+        if shared_state:
+            async with shared_state['lock']:
+                if piece_index in shared_state['pieces_completed']:
+                    can_download = False
+                elif piece_index in shared_state['pieces_downloading']:
+                    can_download = False
+                else:
+                    shared_state['pieces_downloading'].add(piece_index)
+        
+        if (can_download and
+            piece_index not in pieces_completed and 
             piece_index not in pieces_downloading and
             bitfield[piece_index] and 
             len(pieces_downloading) < max_concurrent):
@@ -301,23 +339,26 @@ def request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces,
             # Request first block (offset 0)
             request_length = min(block_size, piece_length)
             request_msg = create_request(piece_index, 0, request_length)
-            peer_socket.sendall(request_msg)
+            writer.write(request_msg)
+            await writer.drain()
             blocks_requested[piece_index].add(0)
             pieces_downloading.add(piece_index)
-            print(f"Requested piece {piece_index}, block 0 (offset 0, {request_length} bytes)")
+            # Reduced logging for speed
+            # print(f"[{peer_ip}] Requested piece {piece_index}, block 0")
             
             if len(pieces_downloading) >= max_concurrent:
                 break
 
 
-def request_next_available_piece(peer_socket, bitfield, piece_length, num_pieces,
-                                 pieces_received, blocks_requested, pieces_downloading,
-                                 pieces_completed, pieces_to_download, block_size=16384):
+async def async_request_next_available_piece(writer, bitfield, piece_length, num_pieces,
+                                             pieces_received, blocks_requested, pieces_downloading,
+                                             pieces_completed, pieces_to_download, block_size,
+                                             shared_state, peer_ip):
     """
-    Requests the next available piece when a piece completes.
+    Requests the next available piece when a piece completes (async version).
     
     Args:
-        peer_socket: socket - Connected socket
+        writer: asyncio.StreamWriter - Async writer
         bitfield: list - List of booleans indicating available pieces
         piece_length: int - Length of each piece
         num_pieces: int - Total number of pieces
@@ -327,13 +368,27 @@ def request_next_available_piece(peer_socket, bitfield, piece_length, num_pieces
         pieces_completed: set - Set of completed pieces
         pieces_to_download: int - Total pieces to download
         block_size: int - Size of each block
+        shared_state: dict - Shared state for multi-peer coordination
+        peer_ip: str - Peer IP for logging
     """
     if not bitfield:
         return
     
     # Find next piece to download
     for piece_index in range(min(pieces_to_download, len(bitfield))):
-        if (piece_index not in pieces_completed and 
+        # Check shared state if available
+        can_download = True
+        if shared_state:
+            async with shared_state['lock']:
+                if piece_index in shared_state['pieces_completed']:
+                    can_download = False
+                elif piece_index in shared_state['pieces_downloading']:
+                    can_download = False
+                else:
+                    shared_state['pieces_downloading'].add(piece_index)
+        
+        if (can_download and
+            piece_index not in pieces_completed and 
             piece_index not in pieces_downloading and
             bitfield[piece_index]):
             
@@ -346,34 +401,36 @@ def request_next_available_piece(peer_socket, bitfield, piece_length, num_pieces
             # Request first block
             request_length = min(block_size, piece_length)
             request_msg = create_request(piece_index, 0, request_length)
-            peer_socket.sendall(request_msg)
+            writer.write(request_msg)
+            await writer.drain()
             blocks_requested[piece_index].add(0)
             pieces_downloading.add(piece_index)
-            print(f"Requested piece {piece_index}, block 0 (offset 0, {request_length} bytes)")
+            # Reduced logging
+            # print(f"[{peer_ip}] Requested piece {piece_index}, block 0")
             break
 
 
-def request_next_blocks(peer_socket, piece_index, piece_length, num_pieces,
-                        pieces_received, blocks_requested, block_size=16384):
+async def async_request_next_blocks(writer, piece_index, piece_length, num_pieces,
+                                    pieces_received, blocks_requested, block_size, peer_ip):
     """
-    Continues requesting more blocks for a piece as blocks are received.
+    Continues requesting more blocks for a piece as blocks are received (async version).
     
     Args:
-        peer_socket: socket - Connected socket
+        writer: asyncio.StreamWriter - Async writer
         piece_index: int - Index of piece to continue requesting
         piece_length: int - Length of each piece
         num_pieces: int - Total number of pieces
         pieces_received: dict - Dictionary of received blocks
         blocks_requested: dict - Dictionary tracking requested blocks
         block_size: int - Size of each block
+        peer_ip: str - Peer IP for logging
     """
     if piece_index not in pieces_received:
         return
     
     # Calculate how many blocks this piece needs
     if piece_index == num_pieces - 1:
-        # Last piece might be smaller - we'll calculate from total size
-        # For now, use piece_length (we'll handle last piece specially later)
+        # Last piece might be smaller
         blocks_needed = (piece_length + block_size - 1) // block_size
     else:
         blocks_needed = piece_length // block_size
@@ -399,20 +456,22 @@ def request_next_blocks(peer_socket, piece_index, piece_length, num_pieces,
         
         # Request this block
         request_msg = create_request(piece_index, offset, request_length)
-        peer_socket.sendall(request_msg)
+        writer.write(request_msg)
+        await writer.drain()
         
         # Track that we requested it
         if piece_index not in blocks_requested:
             blocks_requested[piece_index] = set()
         blocks_requested[piece_index].add(offset)
         
-        print(f"Requested piece {piece_index}, block {block_num} (offset {offset}, {request_length} bytes)")
+        # Reduced logging for speed
+        # print(f"[{peer_ip}] Requested piece {piece_index}, block {block_num}")
         break  # Request one block at a time
 
 
-def connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir='pieces', max_pieces=None):
+async def async_connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir='pieces', max_pieces=None, shared_state=None):
     """
-    Complete peer connection flow: TCP -> Handshake -> Messages.
+    Complete peer connection flow: TCP -> Handshake -> Messages (async version).
     
     Args:
         peer: dict - {'ip': str, 'port': int}
@@ -421,28 +480,31 @@ def connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir='pieces', ma
         info_dict: dict - Torrent info dictionary
         pieces_dir: str - Directory to save pieces
         max_pieces: int - Maximum pieces to download (None = all)
+        shared_state: dict - Shared state for multi-peer coordination
     
     Returns:
         dict - Results from message exchange or None
     """
     # Step 1: Connect and handshake
-    peer_socket, peer_peer_id = connect_and_handshake(peer, info_hash, peer_id)
-    if not peer_socket:
+    reader, writer, peer_peer_id = await async_connect_and_handshake(peer, info_hash, peer_id)
+    if not reader or not writer:
         return None
     
     try:
         # Step 2: Exchange messages
-        result = exchange_messages(peer_socket, info_dict, timeout=60, 
-                                 pieces_dir=pieces_dir, max_pieces_to_download=max_pieces)
+        result = await async_exchange_messages(reader, writer, info_dict, peer['ip'], timeout=120, 
+                                              pieces_dir=pieces_dir, max_pieces_to_download=max_pieces,
+                                              shared_state=shared_state)
         return result
     finally:
-        peer_socket.close()
-        print("Connection closed")
+        writer.close()
+        await writer.wait_closed()
+        print(f"[{peer['ip']}] Connection closed")
 
 
-def connect(peer_list, info_hash, peer_id, info_dict, pieces_dir='pieces', max_pieces=None):
+async def connect(peer_list, info_hash, peer_id, info_dict, pieces_dir='pieces', max_pieces=None, max_peers=5):
     """
-    Attempts to connect to multiple peers.
+    Attempts to connect to multiple peers simultaneously using asyncio.
     
     Args:
         peer_list: list - List of peer dicts
@@ -451,14 +513,58 @@ def connect(peer_list, info_hash, peer_id, info_dict, pieces_dir='pieces', max_p
         info_dict: dict - Torrent info dictionary
         pieces_dir: str - Directory to save pieces
         max_pieces: int - Maximum pieces to download (None = all)
-    """
-    for peer in peer_list:
-        print(f"\n{'='*60}")
-        result = connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir, max_pieces)
-        if result:
-            print(f"Successfully connected to {peer['ip']}:{peer['port']}")
-            return result
-        print(f"Failed to connect to {peer['ip']}:{peer['port']}")
+        max_peers: int - Maximum number of peers to connect to simultaneously (default 5)
     
-    return None
+    Returns:
+        dict - Results from first successful peer connection, or None if all fail
+    """
+    # Shared state for all peer connections
+    shared_state = {
+        'pieces_completed': set(get_saved_pieces(pieces_dir)),
+        'pieces_downloading': set(),
+        'lock': asyncio.Lock(),
+        'results': []
+    }
+    
+    # Select peers to connect to
+    peers_to_connect = min(max_peers, len(peer_list))
+    
+    print(f"\n{'='*60}")
+    print(f"Starting {peers_to_connect} peer connections simultaneously...")
+    print(f"{'='*60}")
+    
+    # Create tasks for all peers
+    tasks = []
+    for peer in peer_list[:peers_to_connect]:
+        task = asyncio.create_task(
+            async_connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir, max_pieces, shared_state)
+        )
+        tasks.append(task)
+    
+    # Wait for all tasks to complete (they run concurrently)
+    # Use asyncio.gather with return_exceptions to get all results
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Find first successful result
+    successful_result = None
+    completed_count = 0
+    
+    for i, result in enumerate(results):
+        peer = peer_list[i] if i < len(peer_list) else None
+        if isinstance(result, Exception):
+            if peer:
+                print(f"[{peer['ip']}] Connection error: {result}")
+        elif result:
+            completed_count += 1
+            if successful_result is None:
+                successful_result = result
+                if peer:
+                    print(f"\n[{peer['ip']}] First successful connection!")
+    
+    print(f"\nCompleted: {completed_count}/{peers_to_connect} peer connections")
+    
+    # Keep connections running - don't cancel them, let them continue downloading
+    # The shared state will coordinate piece downloads across all peers
+    
+    return successful_result
 

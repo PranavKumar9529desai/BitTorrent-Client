@@ -1,5 +1,6 @@
 import random
 import hashlib
+import asyncio
 from decoder import info_dict , decoded_content
 import bencode
 import requests
@@ -60,13 +61,16 @@ print(f"Handshake constructed: {len(handshake_msg)} bytes")
 print(f"  First byte: {handshake_msg[0]}")
 print(f"  Protocol: {handshake_msg[1:20]}\n")
 
-# Connect to peers and exchange messages
+# Connect to peers and exchange messages (async)
 print("="*60)
 print("Attempting to connect to peers...")
 print("="*60)
 
 pieces_dir = 'pieces'
-result = connect(peer_list_parsed, info_hash, peer_id, info_dict_decoded, pieces_dir=pieces_dir)
+
+# Run async connect function
+result = asyncio.run(connect(peer_list_parsed, info_hash, peer_id, info_dict_decoded, 
+                            pieces_dir=pieces_dir, max_peers=5))
 
 if result:
     print("\n" + "="*60)
