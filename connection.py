@@ -10,6 +10,7 @@ from messages import (
     create_interested, create_request, parse_message, parse_bitfield,
     parse_piece, MSG_BITFIELD, MSG_UNCHOKE, MSG_PIECE, MSG_CHOKE
 )
+from piece_manager import get_saved_pieces, is_piece_complete
 
 
 def detect_ip_family(ip_address):
@@ -111,7 +112,7 @@ def connect_and_handshake(peer, info_hash, peer_id, timeout=10):
         return None, None
 
 
-def exchange_messages(peer_socket, info_dict, timeout=30):
+def exchange_messages(peer_socket, info_dict, timeout=30, pieces_dir='pieces', max_pieces_to_download=None):
     """
     Exchanges Peer Wire Protocol messages with a peer.
     
@@ -119,6 +120,8 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
         peer_socket: socket - Connected socket
         info_dict: dict - Torrent info dictionary (for piece length)
         timeout: int - Message timeout in seconds
+        pieces_dir: str - Directory where pieces are saved
+        max_pieces_to_download: int - Maximum pieces to download (None = all)
     
     Returns:
         dict - {'bitfield': list, 'pieces': dict} or None if failed
@@ -130,6 +133,7 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
     pieces_received = {}  # {piece_index: {offset: data}}
     blocks_requested = {}  # {piece_index: set(offsets)} - Track requested blocks
     block_size = 16384  # 16 KB blocks
+    max_concurrent_pieces = 5  # Download up to 5 pieces concurrently
     
     # Calculate piece length
     piece_length = info_dict.get('piece length', 262144)  # Default 256 KB
@@ -139,8 +143,21 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
     else:
         num_pieces = 0
     
+    # Get already saved pieces
+    saved_pieces = get_saved_pieces(pieces_dir)
     print(f"Starting message exchange (expecting {num_pieces} pieces, {piece_length} bytes each)")
     print(f"Each piece needs {piece_length // block_size} blocks of {block_size} bytes")
+    if saved_pieces:
+        print(f"Found {len(saved_pieces)} pieces already saved on disk")
+    
+    # Determine which pieces to download
+    if max_pieces_to_download:
+        pieces_to_download = min(max_pieces_to_download, num_pieces)
+    else:
+        pieces_to_download = num_pieces
+    
+    pieces_downloading = set()  # Track which pieces we're currently downloading
+    pieces_completed = set(saved_pieces)  # Track completed pieces (including saved ones)
     
     try:
         # Send interested message
@@ -188,7 +205,8 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
                     # Start requesting pieces if we have bitfield
                     if bitfield:
                         request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces, 
-                                             pieces_received, blocks_requested, block_size)
+                                             pieces_received, blocks_requested, pieces_downloading,
+                                             pieces_completed, pieces_to_download, block_size)
                 
                 # Handle choke
                 elif message_id == MSG_CHOKE:
@@ -206,7 +224,23 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
                     if piece_index in blocks_requested and block_offset in blocks_requested[piece_index]:
                         blocks_requested[piece_index].discard(block_offset)
                     
-                    print(f"Received PIECE {piece_index} block at offset {block_offset} ({len(block_data)} bytes)")
+                    # Check if piece is now complete
+                    if is_piece_complete(pieces_received, piece_index, piece_length):
+                        if piece_index not in pieces_completed:
+                            pieces_completed.add(piece_index)
+                            pieces_downloading.discard(piece_index)
+                            print(f"✓ Piece {piece_index} completed! ({len(pieces_completed)}/{pieces_to_download} pieces)")
+                            
+                            # Request next piece if we have room
+                            if unchoked and bitfield and len(pieces_downloading) < max_concurrent_pieces:
+                                request_next_available_piece(peer_socket, bitfield, piece_length, num_pieces,
+                                                           pieces_received, blocks_requested, pieces_downloading,
+                                                           pieces_completed, pieces_to_download, block_size)
+                    else:
+                        # Show progress for incomplete pieces (less verbose)
+                        if len(pieces_received[piece_index]) % 4 == 0:  # Print every 4 blocks
+                            blocks_received = len(pieces_received[piece_index])
+                            print(f"Piece {piece_index}: {blocks_received} blocks received")
                     
                     # Check if we need to request more blocks for this piece
                     if unchoked and bitfield and bitfield[piece_index]:
@@ -229,9 +263,10 @@ def exchange_messages(peer_socket, info_dict, timeout=30):
 
 
 def request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces, 
-                          pieces_received, blocks_requested, block_size=16384):
+                          pieces_received, blocks_requested, pieces_downloading,
+                          pieces_completed, pieces_to_download, block_size=16384):
     """
-    Requests initial blocks from first few pieces that peer has.
+    Requests initial blocks from first available pieces that peer has.
     
     Args:
         peer_socket: socket - Connected socket
@@ -240,17 +275,23 @@ def request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces,
         num_pieces: int - Total number of pieces
         pieces_received: dict - Dictionary to store received pieces
         blocks_requested: dict - Dictionary to track requested blocks
+        pieces_downloading: set - Set of piece indices currently being downloaded
+        pieces_completed: set - Set of piece indices already completed
+        pieces_to_download: int - Total number of pieces to download
         block_size: int - Size of each block to request (default 16 KB)
     """
     if not bitfield:
         return
     
-    # Request first block of first few pieces that peer has
-    requested = 0
-    max_concurrent_pieces = 3  # Start with 3 pieces
+    max_concurrent = 5  # Start with 5 pieces concurrently
     
-    for piece_index in range(min(num_pieces, len(bitfield))):
-        if bitfield[piece_index] and requested < max_concurrent_pieces:
+    # Find pieces to download (not already completed, peer has them, not already downloading)
+    for piece_index in range(min(pieces_to_download, len(bitfield))):
+        if (piece_index not in pieces_completed and 
+            piece_index not in pieces_downloading and
+            bitfield[piece_index] and 
+            len(pieces_downloading) < max_concurrent):
+            
             # Initialize tracking
             if piece_index not in blocks_requested:
                 blocks_requested[piece_index] = set()
@@ -262,11 +303,54 @@ def request_initial_blocks(peer_socket, bitfield, piece_length, num_pieces,
             request_msg = create_request(piece_index, 0, request_length)
             peer_socket.sendall(request_msg)
             blocks_requested[piece_index].add(0)
+            pieces_downloading.add(piece_index)
             print(f"Requested piece {piece_index}, block 0 (offset 0, {request_length} bytes)")
-            requested += 1
             
-            if requested >= max_concurrent_pieces:
+            if len(pieces_downloading) >= max_concurrent:
                 break
+
+
+def request_next_available_piece(peer_socket, bitfield, piece_length, num_pieces,
+                                 pieces_received, blocks_requested, pieces_downloading,
+                                 pieces_completed, pieces_to_download, block_size=16384):
+    """
+    Requests the next available piece when a piece completes.
+    
+    Args:
+        peer_socket: socket - Connected socket
+        bitfield: list - List of booleans indicating available pieces
+        piece_length: int - Length of each piece
+        num_pieces: int - Total number of pieces
+        pieces_received: dict - Dictionary of received pieces
+        blocks_requested: dict - Dictionary tracking requested blocks
+        pieces_downloading: set - Set of pieces currently downloading
+        pieces_completed: set - Set of completed pieces
+        pieces_to_download: int - Total pieces to download
+        block_size: int - Size of each block
+    """
+    if not bitfield:
+        return
+    
+    # Find next piece to download
+    for piece_index in range(min(pieces_to_download, len(bitfield))):
+        if (piece_index not in pieces_completed and 
+            piece_index not in pieces_downloading and
+            bitfield[piece_index]):
+            
+            # Initialize tracking
+            if piece_index not in blocks_requested:
+                blocks_requested[piece_index] = set()
+            if piece_index not in pieces_received:
+                pieces_received[piece_index] = {}
+            
+            # Request first block
+            request_length = min(block_size, piece_length)
+            request_msg = create_request(piece_index, 0, request_length)
+            peer_socket.sendall(request_msg)
+            blocks_requested[piece_index].add(0)
+            pieces_downloading.add(piece_index)
+            print(f"Requested piece {piece_index}, block 0 (offset 0, {request_length} bytes)")
+            break
 
 
 def request_next_blocks(peer_socket, piece_index, piece_length, num_pieces,
@@ -326,7 +410,7 @@ def request_next_blocks(peer_socket, piece_index, piece_length, num_pieces,
         break  # Request one block at a time
 
 
-def connect_to_peer(peer, info_hash, peer_id, info_dict):
+def connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir='pieces', max_pieces=None):
     """
     Complete peer connection flow: TCP -> Handshake -> Messages.
     
@@ -335,6 +419,8 @@ def connect_to_peer(peer, info_hash, peer_id, info_dict):
         info_hash: bytes - 20-byte info hash
         peer_id: bytes - 20-byte peer ID
         info_dict: dict - Torrent info dictionary
+        pieces_dir: str - Directory to save pieces
+        max_pieces: int - Maximum pieces to download (None = all)
     
     Returns:
         dict - Results from message exchange or None
@@ -346,14 +432,15 @@ def connect_to_peer(peer, info_hash, peer_id, info_dict):
     
     try:
         # Step 2: Exchange messages
-        result = exchange_messages(peer_socket, info_dict)
+        result = exchange_messages(peer_socket, info_dict, timeout=60, 
+                                 pieces_dir=pieces_dir, max_pieces_to_download=max_pieces)
         return result
     finally:
         peer_socket.close()
         print("Connection closed")
 
 
-def connect(peer_list, info_hash, peer_id, info_dict):
+def connect(peer_list, info_hash, peer_id, info_dict, pieces_dir='pieces', max_pieces=None):
     """
     Attempts to connect to multiple peers.
     
@@ -362,10 +449,12 @@ def connect(peer_list, info_hash, peer_id, info_dict):
         info_hash: bytes - 20-byte info hash
         peer_id: bytes - 20-byte peer ID
         info_dict: dict - Torrent info dictionary
+        pieces_dir: str - Directory to save pieces
+        max_pieces: int - Maximum pieces to download (None = all)
     """
     for peer in peer_list:
         print(f"\n{'='*60}")
-        result = connect_to_peer(peer, info_hash, peer_id, info_dict)
+        result = connect_to_peer(peer, info_hash, peer_id, info_dict, pieces_dir, max_pieces)
         if result:
             print(f"Successfully connected to {peer['ip']}:{peer['port']}")
             return result

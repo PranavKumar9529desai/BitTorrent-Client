@@ -264,3 +264,160 @@ def verify_and_save_piece(piece_index, pieces_dict, piece_hashes, piece_length=2
     else:
         return False
 
+
+def assemble_files_from_pieces(output_dir='downloads', pieces_dir='pieces'):
+    """
+    Assembles saved pieces into the actual files based on torrent structure.
+    
+    Args:
+        output_dir: str - Directory to save assembled files
+        pieces_dir: str - Directory where pieces are stored
+    
+    Returns:
+        list - List of created file paths
+    """
+    info_dict = decoded_content['info']
+    piece_length = info_dict.get('piece length', 262144)
+    
+    # Get all saved pieces
+    saved_pieces = get_saved_pieces(pieces_dir)
+    if not saved_pieces:
+        print("No pieces found to assemble")
+        return []
+    
+    print(f"\nAssembling files from {len(saved_pieces)} pieces...")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Get file structure from torrent
+    files = info_dict.get('files', [])
+    if not files:
+        # Single file torrent
+        file_name = info_dict.get('name', 'output')
+        return assemble_single_file(file_name, saved_pieces, piece_length, 
+                                   info_dict.get('length', 0), output_dir, pieces_dir)
+    else:
+        # Multi-file torrent
+        return assemble_multi_file(files, saved_pieces, piece_length, output_dir, pieces_dir)
+
+
+def assemble_single_file(file_name, saved_pieces, piece_length, total_length, output_dir, pieces_dir):
+    """
+    Assembles a single file from pieces.
+    
+    Args:
+        file_name: str - Name of the file
+        saved_pieces: set - Set of saved piece indices
+        piece_length: int - Length of each piece
+        total_length: int - Total file length
+        output_dir: str - Output directory
+        pieces_dir: str - Pieces directory
+    
+    Returns:
+        list - List with single file path
+    """
+    filepath = os.path.join(output_dir, file_name)
+    
+    print(f"Assembling single file: {file_name}")
+    
+    with open(filepath, 'wb') as f:
+        piece_index = 0
+        bytes_written = 0
+        
+        while bytes_written < total_length:
+            if piece_index in saved_pieces:
+                piece_data = load_piece_from_disk(piece_index, pieces_dir)
+                if piece_data:
+                    # Calculate how much to write (last piece might be smaller)
+                    remaining = total_length - bytes_written
+                    write_size = min(len(piece_data), remaining)
+                    f.write(piece_data[:write_size])
+                    bytes_written += write_size
+                    print(f"  Wrote piece {piece_index} ({write_size:,} bytes) - Total: {bytes_written:,}/{total_length:,} bytes")
+                else:
+                    print(f"  Warning: Piece {piece_index} not found, skipping")
+            else:
+                print(f"  Warning: Piece {piece_index} not saved, file will be incomplete")
+                break
+            
+            piece_index += 1
+    
+    file_size = os.path.getsize(filepath)
+    print(f"✓ File assembled: {filepath} ({file_size:,} bytes)")
+    return [filepath]
+
+
+def assemble_multi_file(files, saved_pieces, piece_length, output_dir, pieces_dir):
+    """
+    Assembles multiple files from pieces.
+    
+    Args:
+        files: list - List of file dicts from torrent
+        saved_pieces: set - Set of saved piece indices
+        piece_length: int - Length of each piece
+        output_dir: str - Output directory
+        pieces_dir: str - Pieces directory
+    
+    Returns:
+        list - List of created file paths
+    """
+    created_files = []
+    current_piece_index = 0
+    current_piece_offset = 0
+    current_piece_data = None
+    
+    for file_info in files:
+        file_path = file_info.get('path', [])
+        file_length = file_info.get('length', 0)
+        
+        # Create full file path
+        if isinstance(file_path, list):
+            full_path = os.path.join(output_dir, *file_path)
+        else:
+            full_path = os.path.join(output_dir, file_path)
+        
+        # Create directory if needed
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        
+        print(f"Assembling file: {'/'.join(file_path) if isinstance(file_path, list) else file_path}")
+        
+        with open(full_path, 'wb') as f:
+            remaining = file_length
+            bytes_written = 0
+            
+            while remaining > 0:
+                # Load piece if needed
+                if current_piece_data is None or current_piece_offset >= len(current_piece_data):
+                    if current_piece_index in saved_pieces:
+                        current_piece_data = load_piece_from_disk(current_piece_index, pieces_dir)
+                        current_piece_offset = 0
+                        if not current_piece_data:
+                            print(f"  Warning: Piece {current_piece_index} not found")
+                            break
+                    else:
+                        print(f"  Warning: Piece {current_piece_index} not saved")
+                        break
+                
+                # Calculate how much to write from current piece
+                available_in_piece = len(current_piece_data) - current_piece_offset
+                write_size = min(remaining, available_in_piece)
+                
+                # Write data
+                f.write(current_piece_data[current_piece_offset:current_piece_offset + write_size])
+                bytes_written += write_size
+                remaining -= write_size
+                current_piece_offset += write_size
+                
+                # Move to next piece if current one is exhausted
+                if current_piece_offset >= len(current_piece_data):
+                    current_piece_index += 1
+                    current_piece_data = None
+                    current_piece_offset = 0
+            
+            file_size = os.path.getsize(full_path)
+            print(f"  ✓ File assembled: {full_path} ({file_size:,} bytes)")
+            created_files.append(full_path)
+    
+    return created_files
+

@@ -6,7 +6,8 @@ import requests
 from parse_peers_list import parse_peer_list
 from handshake import construct_handshake
 from connection import connect
-from piece_manager import get_piece_hashes, verify_and_save_piece, is_piece_complete, get_saved_pieces
+from piece_manager import (get_piece_hashes, verify_and_save_piece, is_piece_complete, 
+                          get_saved_pieces, assemble_files_from_pieces)
 
 
 # peer-id 
@@ -64,7 +65,8 @@ print("="*60)
 print("Attempting to connect to peers...")
 print("="*60)
 
-result = connect(peer_list_parsed, info_hash, peer_id, info_dict_decoded)
+pieces_dir = 'pieces'
+result = connect(peer_list_parsed, info_hash, peer_id, info_dict_decoded, pieces_dir=pieces_dir)
 
 if result:
     print("\n" + "="*60)
@@ -89,13 +91,13 @@ if result:
         print(f"Pieces will be saved to: {pieces_dir}/")
         complete_pieces = 0
         incomplete_pieces = 0
-        saved_pieces = 0
+        saved_pieces_count = 0
         
         for piece_index in result['pieces'].keys():
             if is_piece_complete(result['pieces'], piece_index, piece_length):
                 complete_pieces += 1
                 if verify_and_save_piece(piece_index, result['pieces'], piece_hashes, piece_length, pieces_dir):
-                    saved_pieces += 1
+                    saved_pieces_count += 1
             else:
                 incomplete_pieces += 1
                 blocks_received = len(result['pieces'][piece_index])
@@ -103,8 +105,19 @@ if result:
                 print(f"Piece {piece_index} incomplete: {blocks_received} blocks, {total_size}/{piece_length} bytes")
         
         print(f"\nSummary: {complete_pieces} complete pieces, {incomplete_pieces} incomplete pieces")
-        print(f"Saved {saved_pieces} pieces to disk in '{pieces_dir}/' directory")
+        print(f"Saved {saved_pieces_count} pieces to disk in '{pieces_dir}/' directory")
+    
+    # Assemble files from saved pieces
+    print("\n" + "="*60)
+    print("Assembling files from saved pieces...")
+    print("="*60)
+    
+    assembled_files = assemble_files_from_pieces(output_dir='downloads', pieces_dir=pieces_dir)
+    if assembled_files:
+        print(f"\n✓ Successfully assembled {len(assembled_files)} file(s):")
+        for filepath in assembled_files:
+            print(f"  - {filepath}")
     else:
-        print("No pieces received yet")
+        print("\nNo files could be assembled (missing pieces or no pieces saved)")
 else:
     print("\nFailed to connect to any peers")
