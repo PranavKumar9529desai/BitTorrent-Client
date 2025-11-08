@@ -48,3 +48,100 @@ compact 	Whether or not the client accepts a compacted list of peers or not
 - peer6 is list of ip address of 18 bit = 16 ip address and 2 bits port
 - complete says 8 peer have complete file
 - and so on...
+
+
+### TCP 3-way handshake 
+
+Your Client                    Peer Server
+     |                              |
+     |-------- SYN (seq=x) -------->|
+     |                              |
+     |<----- SYN-ACK (seq=y, ack=x+1) |
+     |                              |
+     |-------- ACK (ack=y+1) ------>|
+     |                              |
+     |    TCP Connection Established |
+
+3. BitTorrent handshake (application layer)
+- __68__ byte format.
+After TCP is established, BitTorrent requires its own handshake.
+Why a separate handshake?
+Verify both peers are talking about the same torrent (info_hash)
+Exchange peer IDs
+Agree on protocol extensions
+
+
+[1 byte][19 bytes        ][8 bytes ][20 bytes    ][20 bytes  ]
+[  19  ][BitTorrent protocol][00000000][info_hash][peer_id  ]
+
+
+
+### Peer Wire Protocol 
+
+1. Bitfield Message (from peer)
+   └─ Peer tells you which pieces they have
+   
+2. Interested Message (you send)
+   └─ You tell peer "I'm interested in your pieces"
+   
+3. Unchoke Message (from peer)
+   └─ Peer says "OK, I'll send you data"
+   
+4. Request Message (you send)
+   └─ You request specific pieces/blocks
+   
+5. Piece Message (from peer)
+   └─ Peer sends you the actual data
+
+
+
+   Your Client                    Peer
+     |                            |
+     |--- Handshake (68 bytes) -->|
+     |<-- Handshake (68 bytes) ---|
+     |                            |
+     |<-- Bitfield ---------------|  (Peer says what pieces they have)
+     |                            |
+     |--- Interested ------------>|  (You say "I want your pieces")
+     |                            |
+     |<-- Unchoke ----------------|  (Peer says "OK, I'll send data")
+     |                            |
+     |--- Request (piece 0, block 0) ->|  (You request specific data)
+     |                            |
+     |<-- Piece (actual data) ----|  (Peer sends the data!)
+     |                            |
+     |--- Request (piece 0, block 1) ->|
+     |<-- Piece (more data) ------|
+     |                            |
+     ... (repeat for all pieces) ...
+
+
+
+### How to parse the messge reading from the Peer
+[4 bytes: message length][1 byte: message ID][message data]
+
+#### Message format
+
+| Name           | ID | Purpose                           |
+| -------------- | -- | --------------------------------- |
+| keep-alive     | —  | No payload, prevent timeout       |
+| choke          | 0  | Stop serving data                 |
+| unchoke        | 1  | Start serving data                |
+| interested     | 2  | I want pieces                     |
+| not interested | 3  | I don’t need pieces               |
+| have           | 4  | Announces possession of a piece   |
+| bitfield       | 5  | Sends full bitmap of pieces owned |
+| request        | 6  | Request a specific block          |
+| piece          | 7  | Contains actual data block        |
+| cancel         | 8  | Cancel request                    |
+| port           | 9  | DHT port                          |
+
+
+
+### Tit for statergy
+Peers choose who to upload to based on who uploads to them.
+
+| You upload fast → you get unchoked → you download fast ✅ |
+| You don’t upload → others choke you → slow downloads ❌ |
+
+This creates mutual benefit.
