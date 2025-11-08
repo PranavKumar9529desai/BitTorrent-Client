@@ -138,7 +138,7 @@ Agree on protocol extensions
 
 
 
-### Tit for statergy
+### Tit for stargey
 Peers choose who to upload to based on who uploads to them.
 
 | You upload fast → you get unchoked → you download fast ✅ |
